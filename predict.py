@@ -11,7 +11,7 @@ from ultralytics import YOLO
 # Настройка CPU/GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
+# 1. АРХИТЕКТУРА НАШЕЙ СЕТИ НА 1923 КАНАЛА
 class SuperTemporalConvNet(nn.Module):
     def __init__(self, in_channels=1923, num_classes=3):
         super(SuperTemporalConvNet, self).__init__()
@@ -91,8 +91,10 @@ def predict_folder(folder_path):
         with torch.no_grad():
             feat_global = mobilenet_global(tensor_global).squeeze().cpu().numpy()
             
-        # Локальный эмбеддинг человека через YOLO
+        # Запуск детектора YOLO
         results = yolo_detector(frame, verbose=False)
+        
+        # ИСПРАВЛЕНИЕ БАГА ТИПА ДАННЫХ: Вытаскиваем первый результат из списка YOLO результатов
         res = results[0]
         
         bx1, by1, bx2, by2 = 0, 0, 640, 480
@@ -101,7 +103,8 @@ def predict_folder(folder_path):
         if len(res.boxes) > 0:
             max_area = 0
             for box in res.boxes:
-                if int(box.cls) == 0:
+                if int(box.cls[0]) == 0: # Подстраховка для извлечения ID класса
+                    # ИСПРАВЛЕНИЕ БАГА РАЗМЕРНОСТИ: Переводим координаты в плоский массив NumPy безопасно
                     coords = box.xyxy.cpu().numpy().astype(int).squeeze()
                     if coords.ndim == 1 and len(coords) == 4:
                         x1, y1, x2, y2 = coords
