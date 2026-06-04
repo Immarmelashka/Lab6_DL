@@ -1,17 +1,18 @@
 import os
 import sys
 import cv2
+import glob
 import numpy as np
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
+from torchvision.models.video import r3d_18
 from PIL import Image
 from ultralytics import YOLO
 
-# Настройка CPU/GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 1. АРХИТЕКТУРА НАШЕЙ СЕТИ НА 1923 КАНАЛА
+# --- АРХИТЕКТУРА МОДЕЛИ 1: 1D-CNN (1923 КАНАЛА) ---
 class SuperTemporalConvNet(nn.Module):
     def __init__(self, in_channels=1923, num_classes=3):
         super(SuperTemporalConvNet, self).__init__()
@@ -19,12 +20,10 @@ class SuperTemporalConvNet(nn.Module):
         self.bn1 = nn.BatchNorm1d(64)
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(0.6)
-        
         self.conv2 = nn.Conv1d(64, 32, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm1d(32)
         self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(0.6)
-        
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(32, num_classes)
         
@@ -34,17 +33,24 @@ class SuperTemporalConvNet(nn.Module):
         x = self.pool(x).squeeze(-1)
         return self.fc(x)
 
-# 2. ЗАГРУЗКА ВСЕХ МОДЕЛЕЙ И ВЕСОВ
-WEIGHTS_PATH = "best_super_cnn.pth"
-if not os.path.exists(WEIGHTS_PATH):
-    print(f"Ошибка: Не найден файл весов {WEIGHTS_PATH} в корне папки.")
-    sys.exit(1)
+# --- ИНИЦИАЛИЗАЦИЯ И ЗАГРУЗКА АНСАМБЛЯ ---
+cnn_model = SuperTemporalConvNet(in_channels=1923, num_classes=3).to(device)
+if os.path.exists("best_super_cnn.pth"):
+    cnn_model.load_state_dict(torch.load("best_super_cnn.pth", map_location=device))
+cnn_model.eval()
 
-model = SuperTemporalConvNet(in_channels=1923, num_classes=3).to(device)
-model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device))
-model.eval()
+# Инициализация 3D-ResNet18 в соответствии со структурой обучения
+resnet3d_model = r3d_18()
+in_features = resnet3d_model.fc.in_features
+resnet3d_model.fc = nn.Sequential(
+    nn.Dropout(p=0.5),
+    nn.Linear(in_features, 3)
+)
+if os.path.exists("best_3d_resnet.pth"):
+    resnet3d_model.load_state_dict(torch.load("best_3d_resnet.pth", map_location=device))
+resnet3d_model.eval()
 
-# Инициализация предобученных экстракторов
+# Загрузка экстракторов фич
 mobilenet_global = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT).to(device).eval()
 mobilenet_global.classifier = nn.Identity()
 
@@ -53,7 +59,7 @@ mobilenet_local.classifier = nn.Identity()
 
 yolo_detector = YOLO("yolov8m-pose.pt")
 
-preprocess = transforms.Compose([
+preprocess_cnn = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -61,71 +67,61 @@ preprocess = transforms.Compose([
 
 CLASS_MAP = {0: "inaction", 1: "move", 2: "work"}
 
-# 3. ЛОГИКА ОБРАБОТКИ ПАПКИ ИЗ 8 КАДРОВ
-def predict_folder(folder_path):
+def predict_ensemble_track(folder_path):
     valid_ext = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
-    images = sorted([os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(valid_ext) and not f.startswith('.')])
+    all_images = sorted([os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(valid_ext) and not f.startswith('.')])
     
-    if len(images) == 0:
-        return "Ошибка: В указанной папке нет изображений."
-        
-    # Адаптация количества кадров строго до 8
-    while len(images) < 8: images.append(images[-1])
-    images = images[:8]
+    if len(all_images) == 0:
+        return "Ошибка: В указанной папке нет подходящих изображений."
+
+    # --- Поток 1: 1D-CNN (8 равномерных кадров из трека) ---
+    indices = np.linspace(0, len(all_images) - 1, 8, dtype=int)
+    cnn_images = [all_images[i] for i in indices]
     
     sequence_features = []
     prev_gray = None
     
-    for pth in images:
+    for pth in cnn_images:
         frame = cv2.imread(pth)
         if frame is None:
             sequence_features.append(np.zeros(1923))
             continue
-            
         frame = cv2.resize(frame, (640, 480))
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Глобальный эмбеддинг всего кадра
         pil_global = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        tensor_global = preprocess(pil_global).unsqueeze(0).to(device)
-        with torch.no_grad():
-            feat_global = mobilenet_global(tensor_global).squeeze().cpu().numpy()
-            
-        # Запуск детектора YOLO
+        feat_global = mobilenet_global(preprocess_cnn(pil_global).unsqueeze(0).to(device)).squeeze().detach().cpu().numpy()
+        
         results = yolo_detector(frame, verbose=False)
+        res = results
         
-        # ИСПРАВЛЕНИЕ БАГА ТИПА ДАННЫХ: Вытаскиваем первый результат из списка YOLO результатов
-        res = results[0]
-        
-        bx1, by1, bx2, by2 = 0, 0, 640, 480
+        # ИСПРАВЛЕНО: Теперь дефолтная рамка инициализируется корректно
+        best_box = [0, 0, 640, 480]
         motion_score, flow_x, flow_y = 0.0, 0.0, 0.0
         
         if len(res.boxes) > 0:
             max_area = 0
             for box in res.boxes:
-                if int(box.cls[0]) == 0: # Подстраховка для извлечения ID класса
-                    # ИСПРАВЛЕНИЕ БАГА РАЗМЕРНОСТИ: Переводим координаты в плоский массив NumPy безопасно
+                if int(box.cls) == 0: # Только класс Person
                     coords = box.xyxy.cpu().numpy().astype(int).squeeze()
                     if coords.ndim == 1 and len(coords) == 4:
                         x1, y1, x2, y2 = coords
                         area = (x2 - x1) * (y2 - y1)
                         if area > max_area:
                             max_area = area
-                            bx1, by1, bx2, by2 = x1, y1, x2, y2
+                            best_box = [x1, y1, x2, y2]
                             
+        bx1, by1, bx2, by2 = best_box
         bx1, by1 = max(0, bx1), max(0, by1)
         bx2, by2 = min(640, bx2), min(480, by2)
         
         person_crop = frame[by1:by2, bx1:bx2]
         if person_crop.size == 0: 
             person_crop = frame
-            
+        
         pil_local = Image.fromarray(cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB))
-        tensor_local = preprocess(pil_local).unsqueeze(0).to(device)
-        with torch.no_grad():
-            feat_local = mobilenet_local(tensor_local).squeeze().cpu().numpy()
-            
-        # Расчет локального оптического потока
+        feat_local = mobilenet_local(preprocess_cnn(pil_local).unsqueeze(0).to(device)).squeeze().detach().cpu().numpy()
+        
         if prev_gray is not None:
             crop_curr = gray[by1:by2, bx1:bx2]
             crop_prev = prev_gray[by1:by2, bx1:bx2]
@@ -138,17 +134,49 @@ def predict_folder(folder_path):
         combined_feat = np.concatenate([feat_global, feat_local, [motion_score, flow_x, flow_y]])
         sequence_features.append(combined_feat)
         
-    # Тензор для 1D-CNN: (Batch=1, Channels=1923, Time=8)
     feat_tensor = torch.tensor(np.array(sequence_features), dtype=torch.float32).transpose(0, 1).unsqueeze(0).to(device)
     with torch.no_grad():
-        outputs = model(feat_tensor)
-        predicted_idx = torch.argmax(outputs, dim=1).item()
+        probs_cnn = torch.softmax(cnn_model(feat_tensor), dim=1).squeeze().cpu().numpy()
+
+    # --- Поток 2: 3D-ResNet18 (Скользящее окно по 16 кадров) ---
+    window_probs = []
+    window_indices = np.linspace(0, max(1, len(all_images) - 16), min(5, len(all_images)//16 + 1), dtype=int)
+    
+    for start_f in window_indices:
+        clip_paths = all_images[start_f : start_f + 16]
+        if len(clip_paths) < 16: 
+            break
         
-    return CLASS_MAP[predicted_idx]
+        frames_3d = []
+        for pth in clip_paths:
+            img = cv2.imread(pth)
+            if img is None: 
+                continue
+            img = cv2.resize(img, (112, 112))
+            frames_3d.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            
+        if len(frames_3d) == 16:
+            video = np.array(frames_3d, dtype=np.float32) / 255.0
+            video = np.transpose(video, (3, 0, 1, 2))
+            video = (video - np.array([0.485, 0.456, 0.406])[:, None, None, None]) / np.array([0.229, 0.224, 0.225])[:, None, None, None]
+            video_tensor = torch.tensor(video, dtype=torch.float32).unsqueeze(0).to(device)
+            
+            with torch.no_grad():
+                probs_res = torch.softmax(resnet3d_model(video_tensor), dim=1).squeeze().cpu().numpy()
+                window_probs.append(probs_res)
+                
+    probs_resnet = np.mean(window_probs, axis=0) if len(window_probs) > 0 else np.array([0.33, 0.33, 0.33])
+
+    # --- Мягкое голосование (Soft Voting) ---
+    w_resnet = np.array([0.65, 0.30, 0.30])
+    w_cnn = np.array([0.35, 0.70, 0.70])
+    
+    final_probs = (probs_resnet * w_resnet) + (probs_cnn * w_cnn)
+    return CLASS_MAP[np.argmax(final_probs)]
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Использование: python predict.py /путь/к/папке/с/8_картинками")
+        print("Использование: python predict.py /путь/к/папке_с_изображениями")
         sys.exit(1)
         
     target_folder = sys.argv[1]
@@ -156,5 +184,4 @@ if __name__ == "__main__":
         print(f"Ошибка: Путь {target_folder} не существует.")
         sys.exit(1)
         
-    result_class = predict_folder(target_folder)
-    print(f"\n[РЕЗУЛЬТАТ]: {result_class}")
+    print(f"\n[АНСАМБЛЕВЫЙ РЕЗУЛЬТАТ ДЛЯ ТРЕКА]: {predict_ensemble_track(target_folder)}")
