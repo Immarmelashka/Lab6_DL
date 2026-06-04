@@ -7,9 +7,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Явно фиксируем стабильную версию numpy перед установкой остальных библиотек
-RUN pip install --no-cache-dir "numpy==1.26.4"
-RUN pip install --no-cache-dir ultralytics opencv-python pillow torchvision
+# Установка зависимостей с жестким ограничением версии numpy
+RUN pip install --no-cache-dir "numpy<2.0.0" ultralytics opencv-python pillow torchvision
 
 # Копируем проект (скрипт + оба файла весов)
 COPY . /app
