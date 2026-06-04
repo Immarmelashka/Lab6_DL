@@ -7,8 +7,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Установка зависимостей
 RUN pip install --no-cache-dir ultralytics opencv-python pillow torchvision
 
-COPY predict.py /app/predict.py
+# ИСПРАВЛЕНИЕ: Копируем ВСЕ файлы из текущей папки (скрипт + оба файла весов)
+COPY . /app
 
 ENTRYPOINT ["python", "/app/predict.py"]
