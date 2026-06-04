@@ -7,10 +7,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Установка зависимостей
+# Явно фиксируем стабильную версию numpy перед установкой остальных библиотек
+RUN pip install --no-cache-dir "numpy==1.26.4"
 RUN pip install --no-cache-dir ultralytics opencv-python pillow torchvision
 
-# ИСПРАВЛЕНИЕ: Копируем ВСЕ файлы из текущей папки (скрипт + оба файла весов)
+# Копируем проект (скрипт + оба файла весов)
 COPY . /app
 
 ENTRYPOINT ["python", "/app/predict.py"]
