@@ -39,7 +39,7 @@ if os.path.exists("best_super_cnn.pth"):
     cnn_model.load_state_dict(torch.load("best_super_cnn.pth", map_location=device))
 cnn_model.eval()
 
-# Инициализация 3D-ResNet18 в соответствии со структурой обучения
+# Инициализация 3D-ResNet18 в соответствии со структурой обучения (с Dropout)
 resnet3d_model = r3d_18()
 in_features = resnet3d_model.fc.in_features
 resnet3d_model.fc = nn.Sequential(
@@ -93,8 +93,6 @@ def predict_ensemble_track(folder_path):
         feat_global = mobilenet_global(preprocess_cnn(pil_global).unsqueeze(0).to(device)).squeeze().detach().cpu().numpy()
         
         results = yolo_detector(frame, verbose=False)
-        
-        # ЖЕСТКОЕ ИСПРАВЛЕНИЕ БАГА: явно забираем первый элемент списка результатов YOLO
         res = results[0]
         
         bx1, by1, bx2, by2 = 0, 0, 640, 480
@@ -179,7 +177,8 @@ if __name__ == "__main__":
         print("Использование: python predict.py /путь/к/папке_с_изображениями")
         sys.exit(1)
         
-    target_folder = sys.argv
+    # ИСПРАВЛЕНИЕ: берем строго первый аргумент пути [1]
+    target_folder = sys.argv[1]
     if not os.path.exists(target_folder):
         print(f"Ошибка: Путь {target_folder} не существует.")
         sys.exit(1)
