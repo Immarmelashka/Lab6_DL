@@ -93,10 +93,11 @@ def predict_ensemble_track(folder_path):
         feat_global = mobilenet_global(preprocess_cnn(pil_global).unsqueeze(0).to(device)).squeeze().detach().cpu().numpy()
         
         results = yolo_detector(frame, verbose=False)
-        res = results
         
-        # ИСПРАВЛЕНО: Теперь дефолтная рамка инициализируется корректно
-        best_box = [0, 0, 640, 480]
+        # ЖЕСТКОЕ ИСПРАВЛЕНИЕ БАГА: явно забираем первый элемент списка результатов YOLO
+        res = results[0]
+        
+        bx1, by1, bx2, by2 = 0, 0, 640, 480
         motion_score, flow_x, flow_y = 0.0, 0.0, 0.0
         
         if len(res.boxes) > 0:
@@ -109,9 +110,8 @@ def predict_ensemble_track(folder_path):
                         area = (x2 - x1) * (y2 - y1)
                         if area > max_area:
                             max_area = area
-                            best_box = [x1, y1, x2, y2]
+                            bx1, by1, bx2, by2 = x1, y1, x2, y2
                             
-        bx1, by1, bx2, by2 = best_box
         bx1, by1 = max(0, bx1), max(0, by1)
         bx2, by2 = min(640, bx2), min(480, by2)
         
@@ -179,7 +179,7 @@ if __name__ == "__main__":
         print("Использование: python predict.py /путь/к/папке_с_изображениями")
         sys.exit(1)
         
-    target_folder = sys.argv[1]
+    target_folder = sys.argv
     if not os.path.exists(target_folder):
         print(f"Ошибка: Путь {target_folder} не существует.")
         sys.exit(1)
